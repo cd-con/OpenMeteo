@@ -1,68 +1,12 @@
-#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
-
 #include <SoftwareSerial.h>
+#include <DHT.h>
 
-struct FixedPoint{
-    short value; 
-    short scale; 
-
-    short getIntegral(FixedPoint num) const {
-        return value / (10 ^ scale);
-    }
-
-    short getFractional() const {
-        return value % (10 ^ scale);
-    }
-
-    double getValue() const {
-        return (double)value / pow(10.0, scale);
-    }
-};
-
-struct ClientPacket{
-    FixedPoint temperature;
-    FixedPoint moisture;
-    FixedPoint windSpeed;
-    FixedPoint pressure;
-};
-
-struct ServerPacket{
-  byte packetType;
-  uint32_t measurementInterval;
-};
-
-bool menuMode = false;
-bool dialogMode = false;
-bool editingNum = false;
-bool needRedraw = false;
-
-enum Screen{
-  REMOTE,
-  LOCAL
-};
-
-enum MenuItem{
-  TIME,
-  DATE,
-  UPDATE_RATE,
-  EXIT
-};
-
-Screen screenCursorPosition = Screen::REMOTE;
-MenuItem menuCursorPosition;
-
-
-#define NEXT 8
-#define PREV 9
-#define OK  10
-
-LiquidCrystal_I2C lcd(0x27, 20, 4);
-RTC_DS1307 watch;
+RTC_DS1307 rtc;
 SoftwareSerial _radio = SoftwareSerial(2,3);
-
-// Chars
+LiquidCrystal_I2C lcd(0x27,20,4);  // set the LCD address to 0x27 for a 16 chars and 2 line display
+DHT am2303(12, DHT22);
 
 byte moist[] = {
   0x04,
@@ -86,250 +30,263 @@ byte celsius[] = {
   0x0C
 };
 
-class CoolInput2{
-  public:
-    byte a;
-    byte maxA;
-    byte b;
-    byte maxB;
+struct ClientPacket{
+    // Размер пакета = 14 байт
+    // При скорости 9600 бод (960 байт/сек)
+    // Передача 1 пакета займёт ~15мс
+    float temperature;
+    float moisture;
+    float windSpeed;
+    float pressure;
+};
 
-    CoolInput2(uint8_t initNum = 0, uint8_t maxA = 0, uint8_t maxB = 0){
-      a = (int)(initNum / 10);
-      b = initNum % 10;
+struct ServerPacket{
+  uint32_t measurementInterval;
+};
+
+class MenuNumber{
+  public:
+    String ItemName = "Item";
+    int8_t value = 0;
+    int8_t maxVal = 59;
+    int8_t minVal = 0;
+
+    MenuNumber(String name, int8_t val = 0, int8_t maxx = 59, int8_t minn = 0){
+      ItemName = name;
+      value = val;
+      maxVal = maxx;
+      minVal = minn;
     }
 
     void Increment(){
-      a++;
-      if (a > maxA){
-        b++;
-        a = 0;
-      }
-      if (b > maxB){
-        a = 0;
-        b = 0;
+      value++;
+      if (value > maxVal){
+        value = minVal;
       }
     }
 
     void Decrement(){
-      a--;
-      if (a == 0){
-        b--;
-        a = maxA;
-      }
-      if (b == 0){
-        a = maxA;
-        b = maxB;
+      value--;
+      if (value < minVal){
+        value = maxVal;
       }
     }
 
-    uint8_t toInt(){
-      return a * 10 + b;
+    String Print(){
+      return String((byte)(value / 10)) + String(value % 10);
     }
 };
+MenuNumber empty(" ");
+MenuNumber menu[] = {
+  MenuNumber("Hours", 0, 23, 0),
+  MenuNumber("Minutes"),
+  MenuNumber("Refresh rate", 30, 60, 5)
+};
 
-#define TIME_MAX_CUR 2;
-#define DATE_MAX_CUR 3;
-#define INTERNAL_MAX_CUR 2;
+MenuNumber selected = empty;
+byte cursor = 255;
 
-CoolInput2 minute;
-CoolInput2 hour;
-CoolInput2 day;
-CoolInput2 month;
-CoolInput2 year;
+bool inMenu = false; 
+bool r = false;
 
-void setup(){
-  _radio.begin(9600);
-  Serial.begin(115200);
-  
-  pinMode(NEXT, INPUT_PULLUP);
-  pinMode(PREV, INPUT_PULLUP);
-  pinMode(OK, INPUT_PULLUP);
-
+void setup()
+{
   lcd.init();
   lcd.backlight();
+  rtc.begin();
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
+  DateTime now = rtc.now();
+  menu[0].value = now.hour();
+  menu[1].value = now.minute();
+
+  pinMode(9, INPUT_PULLUP);
+  pinMode(10, INPUT_PULLUP);
+  pinMode(11, INPUT_PULLUP);
+
+  
   lcd.createChar(0, moist);
   lcd.createChar(1, celsius);
 
-  watch.begin();
-  watch.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  lcd.setCursor(7,0);
+  lcd.print("Meteo");
+  delay(1000);
+  am2303.begin();
+  r = true;
 }
 
-ClientPacket lastPacket;
 
-unsigned long backlightTimer = 15000;
-uint32_t backlightTime = 10000;
+uint32_t dht_timer = 310;
+uint32_t dht_rate = 300;
+float temp = 0;
+float hum = 0;
+ClientPacket last;
 
-void loop(){
-  bool isSleep = millis() >= backlightTimer;
-  if (isSleep){
-    lcd.noBacklight();
-  }
-  if(digitalRead(NEXT) == LOW){
-    needRedraw = true;
-    ResetBacklight();
-    // Код реакции на кнопку некст
-    if (!isSleep){
-      if (menuMode){
-        if (dialogMode){
-          if(editingNum){
-            
-          }
-        }
-        if (menuCursorPosition < 3){
-          menuCursorPosition = (int)menuCursorPosition + 1;
-        }
-      }else{
-        screenCursorPosition = ((int)screenCursorPosition + 1) % 2;
-      }
-    }
+void loop()
+{
+  if(_radio.available() && _radio.readBytes((byte*)&last, sizeof(last))){
+    r = true;
   }
 
-  if(digitalRead(OK) == LOW){
-    needRedraw = true;
-    ResetBacklight();
-    if (!isSleep){
-      if (!menuMode){
-        menuMode = true;
-        menuCursorPosition = MenuItem::TIME;
-      }else if(dialogMode){
-        switch(menuCursorPosition){
-            case MenuItem::TIME:
-              if ((int)menuCursorPosition == TIME_MAX_CUR){
-                dialogMode = false;
-              }     
-            break;  
-            case MenuItem::DATE:
-              if ((int)menuCursorPosition == DATE_MAX_CUR){
-                dialogMode = false;
-              }     
-            break;  
+  dht_timer++;
 
-        }
-        editingNum = !editingNum;
-      }
-      else{
-        if((int)menuCursorPosition != 3){
-            menuCursorPosition = 0;
-            dialogMode = true;
-        }else{
-            menuMode = false;
-        }
-      }
-    }
+  if (dht_timer >= dht_rate){
+    dht_timer = 0;
+    temp = am2303.readTemperature();
+    hum = am2303.readHumidity();
+    r = true;
   }
-
-  if(digitalRead(PREV) == LOW){
-    needRedraw = true;
-    ResetBacklight();
-    // Код реакции на кнопку прев
-    if (!isSleep){
-      if (menuMode){
-        if (menuCursorPosition > 0){
-          menuCursorPosition = (int)menuCursorPosition - 1;
-        }
-      }else{
-        screenCursorPosition = abs(((int)screenCursorPosition - 3) % 2);
-      }
-    }
-  }
-
-  if (needRedraw){
-    needRedraw = false;
-    ScreenDisplay();
-  }
-
-  needRedraw = _radio.readBytes((byte*)&lastPacket, sizeof(lastPacket));  
-}
-
-void ResetBacklight(){
-    lcd.backlight();
-    backlightTimer = millis() + backlightTime;
-}
-
-void ScreenDisplay(){
-  lcd.clear();
-  DateTime now = watch.now();
-  if (!menuMode){
-    switch(screenCursorPosition){
-      case Screen::REMOTE:
-          lcd.setCursor(0,0);
-          lcd.print("Outdoors | " + now.hour() + ':' + now.minute());
-          FixedPoint val;
-          for (byte i = 0; i < 2; i++){
-            switch(i){
-              case 0:
-                val = lastPacket.temperature;
-                lcd.setCursor(0,1);
-                break;
-              case 1:
-                val = lastPacket.moisture;
-                lcd.setCursor(0,2);
-                break;
-            }
-            if (i == 1){
-              lcd.write(0);
-            }
-            lcd.print(val.getValue());
-            if (i == 0){
-              lcd.write(1);
-            }
-            if (i == 1){
-              lcd.print("%");
-            }
-          }
-        break;
-      case Screen::LOCAL:
-        lcd.print("Indoors");
-        break;
-    }
-  }else{
-    if (dialogMode){
-      lcd.blink();
-      switch (menuCursorPosition){
-          case MenuItem::TIME:
-            lcd.print("Set time");
-            // Вывод времени
-            
-            break;
-          case MenuItem::DATE:
-            break;
-          case MenuItem::UPDATE_RATE:
-            break;
-          case MenuItem::EXIT:
-            lcd.noBlink();
-            dialogMode = false;
-            break;
-        }
-          lcd.setCursor(18,3);
-          lcd.print("x");
-          //lcd.setCursor(3,18);
+  if (digitalRead(9) == LOW){
+    r = true;
+    if (selected.ItemName != " "){
+      selected.Decrement();
     }else{
-    lcd.print("Settings");
-    lcd.setCursor(0,1);
-    lcd.print('>' + getLocale(menuCursorPosition));
-    lcd.setCursor(1,2);
-    lcd.print(getLocale(menuCursorPosition + 1));
+      cursor--;
+      inMenu = cursor >= 0 && cursor < 3;    
     }
   }
+
+  if (digitalRead(10) == LOW && inMenu){
+    r = true;
+    if (selected.ItemName != " "){
+      menu[cursor] = selected;
+      if(cursor == 2){
+        ServerPacket packet;
+        packet.measurementInterval = selected.value * 1000;
+        dht_rate = selected.value * 10;
+        _radio.write((byte*)&packet, sizeof(packet));
+      }
+
+      if (cursor > 0 && cursor < 3){
+            // January 21, 2014 at 3am you would call:
+            rtc.adjust(DateTime(2023, 1, 1, menu[0].value, menu[1].value, 0));
+      }
+      selected = empty;
+    }else{
+      selected = menu[cursor];
+    }
+  }
+
+
+  if (digitalRead(11) == LOW){
+    r = true;
+    if (selected.ItemName != " "){
+      selected.Increment();
+    }else{
+      cursor++;
+      inMenu = cursor < 3;    
+    }
+  }
+
+  if (cursor == 4){
+    r = true;
+    cursor = 255;
+  }
+  if (cursor == 254){
+    r = true;
+    cursor = 3;
+  }
+
+  if(r){
+    lcd.clear();
+    if (inMenu){
+      lcd.print("Settings");
+      lcd.setCursor(0,1);
+      if (selected.ItemName != " "){
+        lcd.print("> " + selected.ItemName + "  <" + selected.Print() + ">");
+      }else{
+        lcd.print("> " + menu[cursor].ItemName + " = " + menu[cursor].Print());
+      }
+      if (cursor + 1 <= sizeof(menu)){
+        lcd.setCursor(0,2);
+        lcd.print(menu[cursor + 1].ItemName);
+      }
+    }else{
+      DateTime now = rtc.now();
+      menu[0].value = now.hour();
+      menu[1].value = now.minute();
+      if (cursor == 3){
+        lcd.print("Local | " + menu[0].Print() + ":" + menu[1].Print());
+        lcd.setCursor(0,1);
+        lcd.print(temp);
+        lcd.write(1);
+        lcd.setCursor(9,1);
+        lcd.write(0);
+        lcd.print(String(hum) + "%");
+      }else{
+        lcd.print("Remote | " + menu[0].Print() + ":" + menu[1].Print());
+        lcd.setCursor(0,1);
+        lcd.print(last.temperature);
+        lcd.write(1);
+        lcd.setCursor(9,1);
+        lcd.write(0);
+        lcd.print(String(last.moisture) + "%");
+        lcd.setCursor(0,2);
+        lcd.print(String(last.pressure * 7.5006f) + " mmhg");
+        lcd.setCursor(0,3);
+        byte lvl = bofortConvert(last.windSpeed);
+        lcd.print(String(last.windSpeed) + " m/s " + String(msgBofort(lvl)));
+      }
+
+    }
+    r = false;
+  }
+  delay(100);
 }
 
-String getLocale(MenuItem item){
-  switch(item){
-    case MenuItem::TIME:
-      return "Set time";
+float wLevel[] = {0.2f, 1.5f, 3.3f, 5.4f, 7.9f, 10.7f, 13.8f, 17.1f, 20.7f, 24.4f, 28.4f, 32.6f};
+byte bofortConvert(float w){
+  for (byte i = 0; i < 12; i++){
+    if (w <= wLevel[i]){
+      return i;
+    }
+  }
+  return 12;
+}
+
+String msgBofort(byte lvl){
+  switch (lvl){
+    case 0:
+      return "Calm     ";
       break;
-    case MenuItem::DATE:
-      return "Set date";
+    case 1:
+      return "Quiet    ";
       break;
-    case MenuItem::UPDATE_RATE:
-      return "Set sensor d/rate";
+    case 2:
+      return "Light    ";
       break;
-    case MenuItem::EXIT:
-      return "Exit menu";
+    case 3:
+      return "Weak     ";
+      break;
+    case 4:
+      return "Moderate ";
+      break;
+    case 5:
+      return "Strong   ";
+      break;
+    case 6:
+      return "Strong   ";
+      break;
+    case 7:
+      return "Strong   ";
+      break;
+    case 8:
+      return "V. Strong";
+      break;
+    case 9:
+      return "Storm    ";
+      break;
+    case 10:
+      return "S.Storm  ";
+      break;
+    case 11:
+      return "H.Storm  ";
+      break;
+    case 12:
+      return "Hurricane";
       break;
     default:
-      return "";
+      return "N/A";
       break;
   }
 }
